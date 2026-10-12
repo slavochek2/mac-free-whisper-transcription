@@ -257,9 +257,17 @@ local function pasteResult()
   end
 
   if recordingApp then
-    recordingApp:activate()
+    local target = recordingApp
     recordingApp = nil
+    target:activate()
     hs.timer.usleep(120000)  -- activate() is async; let focus settle
+    -- Never type into an app the user did not dictate into: if focus did not land
+    -- back on the original app, leave the text on the clipboard instead.
+    local front = hs.application.frontmostApplication()
+    if not front or front:pid() ~= target:pid() then
+      notify("Whisper — NOT pasted", "Focus moved to another app. The text is on the clipboard.")
+      return false
+    end
   end
 
   -- Re-verify after activation: that window is where a clipboard manager's restore lands.
@@ -312,14 +320,19 @@ local function runTranscription()
     return
   end
 
-  newTask(cfg.mlxWhisper, function(exitCode, _, _)
+  local task = newTask(cfg.mlxWhisper, function(exitCode, _, _)
     if exitCode == 0 then
       if pasteResult() == false then setState("idle") else setState("done") end
     else
       notify("Whisper", "Transcription failed (audio kept in " .. tostring(RUN_DIR) .. ")")
       setState("idle")
     end
-  end, whisperArgs(TMPFILE, cfg.model, RUN_DIR)):start()
+  end, whisperArgs(TMPFILE, cfg.model, RUN_DIR))
+  if not task:start() then
+    notify("Whisper", "Could not launch " .. cfg.mlxWhisper .. ". Audio kept in " .. tostring(RUN_DIR))
+    recordingApp = nil
+    setState("idle")
+  end
 end
 
 -- ── Audio devices ───────────────────────────────────────────────────────────
@@ -455,49 +468,74 @@ local function saveCallTranscript(transcript, durationSecs, audioFile)
   return mdFile
 end
 
-local function startWhisperOnFile(audioFile, durationSecs)
+local function startWhisperOnFile(audioFile, durationSecs, recordingFile)
+  -- audioFile is what gets transcribed (possibly a trimmed copy); recordingFile is
+  -- the untouched original the transcript is saved next to.
+  recordingFile = recordingFile or audioFile
   -- Same silence guard as dictation: a silent call would otherwise produce a
   -- hallucinated transcript that looks like a record of a real conversation.
   local peak = peakDbfs(audioFile)
   if peak == nil or peak < SILENCE_DBFS then
     finishCall(string.format("%s NOT transcribed — %s. Audio kept.",
-      audioFile:match("[^/]+$"),
+      recordingFile:match("[^/]+$"),
       peak and string.format("peaked at %.1f dBFS, no signal", peak) or "level unreadable"))
     return
   end
 
   local txtFile = cfg.callsDir .. "/" .. audioFile:match("([^/]+)%.wav$") .. ".txt"
-  newTask(cfg.mlxWhisper, function(exitCode, _, _)
-    if exitCode ~= 0 then return finishCall("Transcription failed. Audio kept: " .. audioFile) end
+  local task = newTask(cfg.mlxWhisper, function(exitCode, _, _)
+    if audioFile ~= recordingFile then os.remove(audioFile) end
+    if exitCode ~= 0 then return finishCall("Transcription failed. Audio kept: " .. recordingFile) end
     local f = io.open(txtFile, "r")
     if not f then return finishCall("Transcript file missing: " .. txtFile) end
     local transcript = f:read("*a"):gsub("%s+$", "")
     f:close()
-    local mdFile = saveCallTranscript(transcript, durationSecs, audioFile)
-    if not mdFile then return finishCall("Failed to write transcript next to " .. audioFile) end
+    local mdFile = saveCallTranscript(transcript, durationSecs, recordingFile)
+    if not mdFile then return finishCall("Failed to write transcript next to " .. recordingFile) end
     os.remove(txtFile)  -- the .md carries the same text plus metadata
     playSound("Glass"); setMenubarTitle("✓")
     hs.timer.doAfter(3.0, function() finishCall(nil) end)
     hs.notify.new({title = "Call saved", informativeText = mdFile}):send()
-  end, whisperArgs(audioFile, cfg.callModel, cfg.callsDir)):start()
+  end, whisperArgs(audioFile, cfg.callModel, cfg.callsDir))
+  if not task:start() then
+    if audioFile ~= recordingFile then os.remove(audioFile) end
+    finishCall("Could not launch " .. cfg.mlxWhisper .. ". Audio kept: " .. recordingFile)
+  end
 end
 
 local function runCallTranscription(durationSecs)
   playSound("Pop"); setMenubarTitle("⏳")
 
-  -- Trim a long silent tail before transcribing; Whisper can stall on one.
-  local trimmedFile = callAudioFile:gsub("%.wav$", "_trimmed.wav")
-  newTask("/bin/bash", function(exitCode, stdout, _)
-    local trimEnd = exitCode == 0 and tonumber((stdout:gsub("%s+$", ""))) or nil
-    if not (trimEnd and trimEnd > 10) then
-      return startWhisperOnFile(callAudioFile, durationSecs)
+  -- Whisper can stall on a long silent tail (a call left recording after hang-up),
+  -- so a TRAILING silence of 10s+ is cut from a copy before transcription. Only a
+  -- silence that runs to the end of the file counts: a quiet stretch mid-call is
+  -- followed by speech and must not be cut. The original .wav is never modified.
+  local original = callAudioFile
+  local trimmedFile = original:gsub("%.wav$", "_trimmed.wav")
+  local probe = newTask("/bin/bash", function(exitCode, stdout, _)
+    local total = tonumber((stdout:match("DURATION=([%d%.]+)")))
+    local lastStart, lastEnd
+    for kind, t in stdout:gmatch("silence_(%a+): ([%d%.]+)") do
+      if kind == "start" then lastStart, lastEnd = tonumber(t), nil
+      elseif kind == "end" then lastEnd = tonumber(t) end
     end
-    newTask(FFMPEG, function(ffExit, _, _)
-      if ffExit == 0 then os.rename(trimmedFile, callAudioFile) end
-      startWhisperOnFile(callAudioFile, durationSecs)
-    end, {"-i", callAudioFile, "-t", tostring(trimEnd + 2), "-c", "copy", "-y", trimmedFile}):start()
-  end, {"-c", guards.shellQuote(FFMPEG) .. " -i " .. guards.shellQuote(callAudioFile) ..
-    " -af silencedetect=noise=-30dB:d=10 -f null - 2>&1 | grep silence_end | tail -1 | sed 's/.*silence_end: //;s/ .*//'"}):start()
+    local trailing = exitCode == 0 and total and lastStart and lastStart > 10
+      and (lastEnd == nil or lastEnd >= total - 0.5)
+    if not trailing then return startWhisperOnFile(original, durationSecs) end
+    local ff = newTask(FFMPEG, function(ffExit, _, _)
+      if ffExit == 0 then
+        startWhisperOnFile(trimmedFile, durationSecs, original)
+      else
+        os.remove(trimmedFile)
+        startWhisperOnFile(original, durationSecs)
+      end
+    end, {"-i", original, "-t", tostring(lastStart + 2), "-c", "copy", "-y", trimmedFile})
+    if not ff:start() then startWhisperOnFile(original, durationSecs) end
+  end, {"-c", "echo DURATION=$(" .. guards.shellQuote(FFPROBE) ..
+    " -v error -show_entries format=duration -of csv=p=0 " .. guards.shellQuote(original) .. "); " ..
+    guards.shellQuote(FFMPEG) .. " -i " .. guards.shellQuote(original) ..
+    " -af silencedetect=noise=-30dB:d=10 -f null - 2>&1 | grep -E 'silence_(start|end)'"})
+  if not probe:start() then startWhisperOnFile(original, durationSecs) end
 end
 
 local function startCallRecording()
@@ -506,6 +544,10 @@ local function startCallRecording()
     return notify("Call Recording NOT started", "Cannot create " .. cfg.callsDir)
   end
   local dev = getAudioDevices()
+  if not SWITCH_CMD then
+    return notify("Call Recording NOT started",
+      "SwitchAudioSource not found. Run ./install.sh --with-calls.")
+  end
   if not dev.blackhole then
     return notify("Call Recording NOT started",
       "BlackHole 2ch not found. Run ./install.sh --with-calls, then see the README for the Multi-Output Device step.")
@@ -513,6 +555,14 @@ local function startCallRecording()
 
   savedOutput = getCurrentOutput()
   switchAudio(cfg.multiOutputDevice)
+  -- Without the switch the recorder hears only your mic, which looks like a
+  -- successful recording until you read the transcript. Refuse instead.
+  if getCurrentOutput() ~= cfg.multiOutputDevice then
+    if savedOutput then switchAudio(savedOutput); savedOutput = nil end
+    return notify("Call Recording NOT started", string.format(
+      "Could not switch sound output to %q. Create it in Audio MIDI Setup (see README).",
+      cfg.multiOutputDevice))
+  end
 
   callAudioFile = cfg.callsDir .. "/" .. os.date("%Y-%m-%d_%H%M%S") .. ".wav"
   callStartTime = os.time()
@@ -637,6 +687,11 @@ function M.setup(opts)
   -- Last, and inside pcall: a failure in a notification must not cost the hotkeys.
   local ok, err = pcall(reportOrphanRecordings)
   if not ok then hs.printf("mac_whisper: orphan report failed (non-fatal): %s", tostring(err)) end
+  -- Recordings younger than the grace period are skipped above (they may still be
+  -- transcribing), so look again once they are old enough.
+  M._orphanRecheck = hs.timer.doAfter(guards.ORPHAN_GRACE_SECS + 10, function()
+    pcall(reportOrphanRecordings)
+  end)
   return M
 end
 

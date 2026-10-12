@@ -15,7 +15,7 @@ While you dictate, a small floating badge shows a live sound wave, so you can se
 
 - A Mac with **Apple Silicon** (M1 or later). Intel Macs and other operating systems are not supported.
 - [Homebrew](https://brew.sh)
-- About 2 GB of disk space for the model
+- About 2 GB of disk space for the dictation model, plus about 3 GB more if you use call recording (it downloads a larger model on first use). Call recordings are kept as `.wav` files, roughly 10 MB per minute.
 
 ## Install
 
@@ -67,13 +67,13 @@ ffmpeg -f avfoundation -list_devices true -i ""
 
 ## Call recording
 
-macOS doesn't let apps record system audio directly. The usual free fix is [BlackHole](https://github.com/ExistentialAudio/BlackHole), a virtual audio device. `./install.sh --with-calls` installs it, and then you do one manual step:
+To capture the other side of a call this tool uses [BlackHole](https://github.com/ExistentialAudio/BlackHole), a virtual audio device. `./install.sh --with-calls` installs it, and then you do one manual step:
 
 1. Open **Audio MIDI Setup** (in Applications › Utilities).
 2. Click **+** at the bottom left › **Create Multi-Output Device**.
 3. Tick **BlackHole 2ch** and your speakers or headphones. Leave its name as `Multi-Output Device`, or set `multiOutputDevice` in the config to match.
 
-When you press ⌃⇧C, sound output switches to that device so the recorder hears the call. When you stop, output switches back to what it was. The recording mixes your mic with the call audio. The `.wav` and a `.md` transcript are saved to `callsDir`. Recording warns at 60 minutes and stops at 90 (`callWarnMinutes`, `callMaxMinutes`).
+When you press ⌃⇧C, sound output switches to that device (if it can't, recording does not start) so the recorder hears the call. When you stop, output switches back to what it was. The recording mixes your mic with the call audio. The `.wav` and a `.md` transcript are saved to `callsDir`. Recording warns at 60 minutes and stops at 90 (`callWarnMinutes`, `callMaxMinutes`).
 
 **Recording calls may require everyone's consent where you live. Ask first.**
 
@@ -85,7 +85,8 @@ Whisper never says "I heard nothing". On silence or hiss it makes up a confident
 - **Hallucination guard:** a stock phrase from a long recording, or far too few words for the length of the audio, is *not* pasted. The text goes on the clipboard instead, in case it was real.
 - **Clipboard check:** the clipboard is checked right before ⌘V, so if the copy failed it never pastes what was there before (which could be a password).
 - **Private scratch space:** audio and transcripts go in a fresh `0700` directory for each recording (`~/.cache/mac-whisper/`), never a fixed path in `/tmp` that another process could tamper with.
-- **No silent loss:** dictation audio is kept for 7 days. A recording that never got transcribed (for example because Hammerspoon reloaded) is never deleted automatically, and you're told about it at the next startup.
+- **Right app only:** if focus has moved to a different app by the time the text is ready, it is not pasted; it stays on the clipboard.
+- **No silent loss:** dictation audio is kept for 7 days. A recording that never got transcribed (for example because Hammerspoon reloaded) is never deleted automatically, and you're told about it shortly after the next startup. The original call `.wav` is never modified.
 
 ## Troubleshooting
 

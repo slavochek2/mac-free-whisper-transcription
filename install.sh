@@ -49,10 +49,15 @@ fi
 say "Downloading the Whisper model ($MODEL, ~1.6 GB, one time)"
 TMP="$(mktemp -d)"
 "$(brew --prefix)/bin/ffmpeg" -loglevel error -f lavfi -i "sine=frequency=440:duration=1" "$TMP/warmup.wav"
-"$VENV/bin/mlx_whisper" "$TMP/warmup.wav" --model "$MODEL" --output-dir "$TMP" >/dev/null 2>&1 || true
+MODEL_OK=1
+if ! "$VENV/bin/mlx_whisper" "$TMP/warmup.wav" --model "$MODEL" --output-dir "$TMP" >"$TMP/log" 2>&1; then
+  MODEL_OK=0
+  echo "WARNING: model download/test run failed. Last lines:"; tail -5 "$TMP/log"
+  echo "Dictation will try to download it again on first use. Check your network and re-run ./install.sh."
+fi
 rm -rf "$TMP"
 
-say "Done. Remaining manual steps:"
+if [[ $MODEL_OK == 1 ]]; then say "Done. Remaining manual steps:"; else say "Installed, but the model step FAILED (see above). Remaining manual steps:"; fi
 cat <<STEPS
   1. Open Hammerspoon (Applications). Grant it Accessibility when asked
      (System Settings > Privacy & Security > Accessibility), so it can paste.
